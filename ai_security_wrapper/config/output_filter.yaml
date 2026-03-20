@@ -1,0 +1,412 @@
+# ============================================================
+# Layer 5 — Output Filter Configuration
+# Sources: Microsoft Presidio docs, LiteLLM guardrail guide,
+#          OWASP LLM Top 10 (2025), GDPR/HIPAA/PCI-DSS,
+#          "Building PII Detection" (oneuptime, Jan 2026)
+# ============================================================
+
+output_filter:
+
+  # ──────────────────────────────────────────────────────────
+  # GENERAL SETTINGS
+  # ──────────────────────────────────────────────────────────
+  enabled: true
+  on_violation: "redact"                # "redact" | "block" | "flag"
+  # "redact"  — replace sensitive content and return the cleaned response
+  # "block"   — return a policy-refusal message, discard the full response
+  # "flag"    — pass through but emit a WARNING audit event (dev/debug only)
+
+  max_output_length: 8000               # truncate responses longer than this
+  truncation_suffix: "\n\n[Response truncated by output policy]"
+
+  # ──────────────────────────────────────────────────────────
+  # PII DETECTION (Microsoft Presidio)
+  # Per-entity confidence thresholds based on liteLLM 2025 guide.
+  # Higher threshold = fewer false positives, more misses.
+  # Lower threshold = more detections, some false positives.
+  # ──────────────────────────────────────────────────────────
+  pii_detection:
+    enabled: true
+    engine: "presidio"                  # "presidio" | "custom" | "both"
+    language: "en"
+    multilingual: false                 # set true to scan in multiple languages
+
+    # Default replacement token when PII is found
+    default_replacement: "[REDACTED]"
+
+    # Emails that should NEVER be redacted (public-facing contact addresses)
+    email_allowlist:
+      - "support@finnova.com"
+
+    # Per-entity configuration
+    # action: "redact" | "mask" | "hash" | "block_response"
+    # score_threshold: Presidio confidence score (0.0–1.0)
+    entities:
+
+      # Identity
+      PERSON:
+        action: "redact"
+        score_threshold: 0.75
+        replacement: "[PERSON]"
+
+      EMAIL_ADDRESS:
+        action: "redact"
+        score_threshold: 0.6            # lower threshold — emails are high-risk
+        replacement: "[EMAIL]"
+
+      PHONE_NUMBER:
+        action: "redact"
+        score_threshold: 0.4
+        replacement: "[PHONE]"
+
+      # Financial
+      CREDIT_CARD:
+        action: "block_response"        # never pass through credit card numbers
+        score_threshold: 0.8
+        replacement: "[CREDIT_CARD]"
+
+      IBAN_CODE:
+        action: "redact"
+        score_threshold: 0.8
+        replacement: "[IBAN]"
+
+      # Government IDs
+      US_SSN:
+        action: "block_response"
+        score_threshold: 0.7
+        replacement: "[SSN]"
+
+      US_DRIVER_LICENSE:
+        action: "redact"
+        score_threshold: 0.7
+        replacement: "[DRIVER_LICENSE]"
+
+      US_PASSPORT:
+        action: "redact"
+        score_threshold: 0.7
+        replacement: "[PASSPORT]"
+
+      US_BANK_NUMBER:
+        action: "redact"
+        score_threshold: 0.75
+        replacement: "[BANK_ACCOUNT]"
+
+      # Network / Technical
+      IP_ADDRESS:
+        action: "redact"
+        score_threshold: 0.6
+        replacement: "[IP_ADDRESS]"
+
+      URL:
+        action: "flag"                  # flag only — URLs often appear legitimately
+        score_threshold: 0.8
+        replacement: "[URL]"
+
+      # Location
+      LOCATION:
+        action: "flag"
+        score_threshold: 0.75
+        replacement: "[LOCATION]"
+
+      # Date / time (often needed in responses — flag, don't redact by default)
+      DATE_TIME:
+        action: "flag"
+        score_threshold: 0.85
+        replacement: "[DATE]"
+
+      # Crypto
+      CRYPTO:
+        action: "redact"                # Bitcoin/Ethereum wallet addresses
+        score_threshold: 0.75
+        replacement: "[CRYPTO_WALLET]"
+
+      # Medical (HIPAA relevance)
+      MEDICAL_LICENSE:
+        action: "redact"
+        score_threshold: 0.7
+        replacement: "[MEDICAL_LICENSE]"
+
+      NRP:                              # National Registration / ID Numbers
+        action: "redact"
+        score_threshold: 0.7
+        replacement: "[NATIONAL_ID]"
+
+  # ──────────────────────────────────────────────────────────
+  # SECRET / CREDENTIAL PATTERN DETECTION
+  # Regex-based — catches secrets that Presidio NER won't.
+  # Patterns sourced from: truffleHog, detect-secrets, GitLeaks
+  # ──────────────────────────────────────────────────────────
+  secret_patterns:
+
+    # AI Provider Keys
+    - pattern: "sk-[a-zA-Z0-9]{20,}"
+      label: "OpenAI API key"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "sk-ant-api[0-9]+-[a-zA-Z0-9\\-_]{20,}"
+      label: "Anthropic API key"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "sk-proj-[a-zA-Z0-9]{40,}"
+      label: "OpenAI project key"
+      action: "redact"
+      severity: "critical"
+
+    # Cloud Provider Keys
+    - pattern: "AKIA[0-9A-Z]{16}"
+      label: "AWS Access Key ID"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "(?i)aws[_\\-]?secret[_\\-]?access[_\\-]?key[\\s:=]+[A-Za-z0-9/+=]{40}"
+      label: "AWS Secret Access Key"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "AIza[0-9A-Za-z\\-_]{35}"
+      label: "Google API key"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "ya29\\.[0-9A-Za-z\\-_]+"
+      label: "Google OAuth access token"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+      label: "Azure client secret (GUID format)"
+      action: "flag"                    # GUIDs are common — flag only
+      severity: "medium"
+
+    # Source Control
+    - pattern: "ghp_[a-zA-Z0-9]{36}"
+      label: "GitHub personal access token"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "ghs_[a-zA-Z0-9]{36}"
+      label: "GitHub app token"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "glpat-[a-zA-Z0-9\\-_]{20}"
+      label: "GitLab personal access token"
+      action: "redact"
+      severity: "critical"
+
+    # Messaging / Communication
+    - pattern: "xoxb-[0-9]+-[0-9]+-[a-zA-Z0-9]+"
+      label: "Slack bot token"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "xoxp-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"
+      label: "Slack user token"
+      action: "redact"
+      severity: "critical"
+
+    # Database connection strings
+    - pattern: "(?i)(mongodb|postgresql|mysql|redis|mssql|sqlite)://[^\\s]+"
+      label: "Database connection string"
+      action: "redact"
+      severity: "critical"
+
+    - pattern: "(?i)password[s]?[\\s]*[=:][\\s]*[^\\s]{6,}"
+      label: "Password literal"
+      action: "redact"
+      severity: "high"
+
+    - pattern: "(?i)passwd[\\s]*[=:][\\s]*[^\\s]{6,}"
+      label: "Passwd literal"
+      action: "redact"
+      severity: "high"
+
+    # Generic Secrets
+    - pattern: "(?i)secret[_\\-]?key[\\s]*[=:][\\s]*[^\\s]{8,}"
+      label: "Secret key literal"
+      action: "redact"
+      severity: "high"
+
+    - pattern: "(?i)api[_\\-]?key[\\s]*[=:][\\s]*[^\\s]{8,}"
+      label: "API key literal"
+      action: "redact"
+      severity: "high"
+
+    - pattern: "(?i)private[_\\-]?key[\\s]*[=:][\\s]*[^\\s]{8,}"
+      label: "Private key literal"
+      action: "redact"
+      severity: "high"
+
+    - pattern: "Bearer\\s+[a-zA-Z0-9\\-._~+/]+=*"
+      label: "Bearer token"
+      action: "redact"
+      severity: "high"
+
+    - pattern: "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+      label: "PEM private key"
+      action: "block_response"
+      severity: "critical"
+
+    - pattern: "(?i)\\.env[\\s]"
+      label: ".env file reference"
+      action: "flag"
+      severity: "medium"
+
+    # Crypto Wallets
+    - pattern: "[13][a-km-zA-HJ-NP-Z1-9]{25,34}"
+      label: "Bitcoin wallet address"
+      action: "flag"
+      severity: "medium"
+
+    - pattern: "0x[a-fA-F0-9]{40}"
+      label: "Ethereum wallet address"
+      action: "flag"
+      severity: "medium"
+
+  # ──────────────────────────────────────────────────────────
+  # CONTENT POLICY
+  # Block responses containing harmful or prohibited content.
+  # ──────────────────────────────────────────────────────────
+  content_policy:
+    enabled: true
+
+    # Keyword-based blocking (case-insensitive substring match)
+    blocked_topics:
+      - "instructions to harm"
+      - "how to make weapons"
+      - "how to make explosives"
+      - "detailed synthesis instructions"     # drug synthesis
+      - "child sexual"
+      - "csam"
+      - "malware source code"
+      - "ransomware"
+      - "keylogger code"
+      - "exploit code"
+
+    # Regex-based blocking (more precise)
+    blocked_regex_patterns:
+      - "step[s]? (to|for) (make|build|create|synthesize) .{0,30}(weapon|bomb|explosive)"
+      - "how to (hack|break into|compromise) .{0,40}(system|server|account|database)"
+
+    # Response must contain at least this ratio of printable ASCII
+    # Blocks responses that are mostly binary/garbage
+    min_printable_ratio: 0.8
+
+    # Maximum ratio of characters from a single non-Latin Unicode block
+    # Catches unexpected language switches that may indicate jailbreak output
+    max_single_script_ratio: 0.95
+
+  # ──────────────────────────────────────────────────────────
+  # CUSTOM DOMAIN-SPECIFIC RECOGNIZERS
+  # Add patterns for your company's internal sensitive data.
+  # These are applied AFTER the standard Presidio scan.
+  # ──────────────────────────────────────────────────────────
+  custom_recognizers:
+    enabled: true
+    recognizers:
+      - name: "internal_employee_id"
+        pattern: "EMP-[0-9]{6}"
+        label: "Employee ID"
+        action: "redact"
+        replacement: "[EMPLOYEE_ID]"
+        score: 0.9
+
+      - name: "internal_ticket_id"
+        pattern: "TKT-[0-9]{8}"
+        label: "Internal ticket ID"
+        action: "flag"
+        score: 0.9
+
+      - name: "finnova_user_id"
+        pattern: "U0[0-9]{2}"
+        label: "FINNOVA_USER_ID"
+        action: "redact"
+        replacement: "[USER_ID]"
+        score: 0.95
+
+      - name: "account_balance"
+        pattern: "(?i)(?:balance|bal)[:\\s]+\\$?[0-9,]+\\.\\d{2}"
+        label: "ACCOUNT_BALANCE"
+        action: "redact"
+        replacement: "[BALANCE_REDACTED]"
+        score: 0.9
+
+      - name: "risk_score"
+        pattern: "(?i)risk[_ ]?score[:\\s]+[0-9]+\\.\\d+"
+        label: "RISK_SCORE"
+        action: "redact"
+        replacement: "[RISK_SCORE_REDACTED]"
+        score: 0.9
+
+      - name: "kyc_status_with_name"
+        pattern: "(?i)kyc[_ ]?(?:status)?[:\\s]+(?:verified|pending|rejected)"
+        label: "KYC_STATUS"
+        action: "redact"
+        replacement: "[KYC_REDACTED]"
+        score: 0.85
+
+      - name: "account_status"
+        pattern: "(?i)(?:account )?status[:\\s]+(?:active|suspended|closed)"
+        label: "ACCOUNT_STATUS"
+        action: "redact"
+        replacement: "[STATUS_REDACTED]"
+        score: 0.85
+
+      - name: "phone_number_custom"
+        pattern: "\\+?\\d[\\-\\s]?\\d{3}[\\-\\s]?\\d{4}"
+        label: "PHONE_NUMBER"
+        action: "redact"
+        replacement: "[PHONE]"
+        score: 0.85
+
+  # ──────────────────────────────────────────────────────────
+  # SENSITIVE VALUE REGISTRY (Knowledge-Base-Aware Redaction)
+  # Auto-extracts sensitive values from knowledge base documents
+  # at startup. Matches output against this registry using exact,
+  # fuzzy, and number-word matching. Deterministic, zero API calls.
+  # ──────────────────────────────────────────────────────────
+  sensitive_registry:
+    enabled: true
+    fuzzy_threshold: 0.8                   # SequenceMatcher ratio for fuzzy name matching
+    number_proximity_pct: 15               # match written numbers within 15% of known value
+    min_value_length: 3                    # skip registry values shorter than this
+
+    category_replacements:
+      USER_PII: "[PII_REDACTED]"
+      USER_ID: "[USER_ID_REDACTED]"
+      FINANCIAL_ACCOUNT_DATA: "[FINANCIAL_DATA_REDACTED]"
+      RISK_SCORE: "[RISK_SCORE_REDACTED]"
+      CORPORATE_FINANCIAL: "[CORPORATE_FINANCIAL_REDACTED]"
+      SECURITY_THRESHOLD: "[SECURITY_THRESHOLD_REDACTED]"
+      COMPLIANCE_THRESHOLD: "[COMPLIANCE_REDACTED]"
+      LEGAL_DATA: "[LEGAL_REDACTED]"
+      LOAN_DATA: "[LOAN_TERMS_REDACTED]"
+
+  # ──────────────────────────────────────────────────────────
+  # RESPONSE ENRICHMENT
+  # Add metadata to the response about what was filtered.
+  # ──────────────────────────────────────────────────────────
+  response_metadata:
+    include_filter_summary: true        # add "meta.output_filter" to response JSON
+    summary_fields:
+      - "pii_redacted"                  # bool
+      - "pii_entity_count"              # int
+      - "secrets_redacted"              # bool
+      - "secret_types_found"            # list of labels
+      - "policy_violations"             # list of blocked topics
+      - "truncated"                     # bool
+    # Never expose: the actual redacted values or their positions
+
+  # ──────────────────────────────────────────────────────────
+  # AUDIT EVENTS EMITTED BY OUTPUT FILTER
+  # ──────────────────────────────────────────────────────────
+  audit_events:
+    - "PII_REDACTED"
+    - "PII_BLOCKED"
+    - "SECRET_REDACTED"
+    - "SECRET_BLOCKED"
+    - "POLICY_VIOLATION"
+    - "RESPONSE_TRUNCATED"
+    - "OUTPUT_FILTER_ERROR"

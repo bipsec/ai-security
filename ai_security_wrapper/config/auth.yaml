@@ -1,0 +1,273 @@
+# ============================================================
+# Layer 2 — Authentication & RBAC Configuration
+# Sources: JWT Security Best Practices (APIsec 2025),
+#          NIST SP 800-63B, OAuth 2.0 Security BCP (RFC 9700),
+#          NSA/CISA Zero Trust guidance
+# ============================================================
+
+auth:
+
+  # ──────────────────────────────────────────────────────────
+  # JWT ACCESS TOKENS
+  # Research: 15–60 min access token lifetime is the 2025
+  # industry baseline (APIsec, skycloak, phasetwo guides).
+  # RS256 (asymmetric) preferred over HS256 in multi-service
+  # deployments — if signing key leaks, verify key is separate.
+  # ──────────────────────────────────────────────────────────
+  access_token:
+    algorithm: "HS256"                  # "HS256" (simple) | "RS256" (production)
+    expiry_minutes: 60                  # 15–60 min recommended; lower = more secure
+    issuer: "ai-security-wrapper"       # "iss" claim — validate on every request
+    audience: "ai-security-wrapper-api" # "aud" claim — validate on every request
+    # Loaded from .env: JWT_SECRET (HS256) or JWT_PRIVATE_KEY_PATH (RS256)
+
+    # Claims to include in every token (beyond sub/iat/exp/iss/aud)
+    standard_claims:
+      - "sub"           # user ID
+      - "iat"           # issued-at
+      - "exp"           # expiry
+      - "jti"           # unique token ID — enables single-use revocation
+      - "iss"           # issuer
+      - "aud"           # audience
+    custom_claims:
+      - "role"          # RBAC role
+      - "tenant_id"     # for multi-tenant deployments
+      - "session_id"    # links access token to a session record
+
+    # Explicitly reject these algorithms to prevent algorithm confusion attacks
+    # (CVE-2015-9235 style: attacker sets alg=none or alg=HS256 on RS256 system)
+    rejected_algorithms:
+      - "none"
+      - "RS256"         # reject if your system uses HS256, and vice versa
+      - "HS384"
+      - "HS512"
+      - "ES256"
+      - "PS256"
+
+    # Token payload constraints
+    payload:
+      max_size_bytes: 2048              # reject unusually large tokens
+      exclude_from_payload:            # NEVER embed these in token payload
+        - "password"
+        - "password_hash"
+        - "secret"
+        - "api_key"
+        - "credit_card"
+        - "ssn"
+
+  # ──────────────────────────────────────────────────────────
+  # REFRESH TOKENS
+  # Research: Rotate on every use — stolen old token becomes
+  # useless immediately. Store SHA-256 hash in DB, not raw.
+  # (freecodecamp, serverion, skycloak 2025 guidance)
+  # ──────────────────────────────────────────────────────────
+  refresh_token:
+    enabled: true
+    expiry_days: 7                      # 7–30 days is standard
+    max_rotations: 30                   # invalidate family after N rotations
+    rotate_on_use: true                 # single-use — new token issued each refresh
+    storage: "db"                       # "memory" | "db" | "redis"
+    store_as_hash: true                 # store SHA-256(token), never raw
+    # Loaded from .env: JWT_REFRESH_SECRET (separate from access token secret)
+    cookie:
+      http_only: true                   # blocks JS access, prevents XSS theft
+      secure: true                      # HTTPS only
+      same_site: "Strict"               # CSRF protection
+      path: "/auth/refresh"             # narrow path — cookie only sent to refresh endpoint
+      domain: ""                        # leave blank to match exact host
+
+  # ──────────────────────────────────────────────────────────
+  # TOKEN REVOCATION
+  # JWTs are stateless — revocation requires server-side tracking.
+  # Track revoked JTI claims in a fast store (Redis/memory).
+  # ──────────────────────────────────────────────────────────
+  revocation:
+    enabled: true
+    storage: "memory"                   # "memory" | "redis"
+    redis_url: ""
+    cache_ttl_seconds: 3600             # keep revoked JTIs until their natural expiry
+    # Trigger token revocation on these events:
+    revoke_on:
+      - "logout"
+      - "password_change"
+      - "role_change"
+      - "suspicious_activity_detected"
+      - "admin_force_logout"
+      - "account_disabled"
+
+  # ──────────────────────────────────────────────────────────
+  # BRUTE-FORCE PROTECTION
+  # Lock accounts / IPs after repeated failed auth attempts.
+  # ──────────────────────────────────────────────────────────
+  brute_force:
+    enabled: true
+    max_failed_attempts: 5              # before lockout
+    observation_window_minutes: 10      # rolling window
+    lockout_duration_minutes: 30        # auto-unlock after this period
+    lockout_type: "ip_and_user"         # "ip" | "user" | "ip_and_user"
+    progressive_delay:
+      enabled: true
+      base_delay_ms: 200                # first failure adds 200ms
+      multiplier: 2.0                   # doubles per failure: 200, 400, 800…
+      max_delay_ms: 5000
+    notify_on_lockout: true             # emit ANOMALY audit event
+
+  # ──────────────────────────────────────────────────────────
+  # RBAC — ROLES & PERMISSIONS
+  # Principle of least privilege: every role only has what it
+  # strictly needs. Permissions are positive grants only.
+  # ──────────────────────────────────────────────────────────
+  roles:
+
+    read_only:
+      description: "Can query the agent but cannot use tools or modify config"
+      allowed_actions:
+        - "query"                       # ask the agent a question
+        - "view_own_history"            # see your own conversation history
+      denied_actions:
+        - "execute_tool"
+        - "modify_config"
+        - "view_audit_logs"
+        - "manage_users"
+        - "delete_data"
+      rate_limit_multiplier: 0.5
+      token_expiry_override_minutes: 30 # shorter token lifetime for low-trust role
+      max_concurrent_sessions: 1
+      allowed_endpoints:
+        - "GET /health"
+        - "POST /agent/query"
+        - "GET /auth/refresh"
+
+    agent_user:
+      description: "Standard user — can query the agent and invoke approved tools"
+      allowed_actions:
+        - "query"
+        - "execute_tool"
+        - "view_own_history"
+      denied_actions:
+        - "modify_config"
+        - "view_audit_logs"
+        - "manage_users"
+        - "delete_data"
+      rate_limit_multiplier: 1.0
+      token_expiry_override_minutes: null   # use global default
+      max_concurrent_sessions: 3
+      allowed_endpoints:
+        - "GET /health"
+        - "POST /agent/query"
+        - "GET /auth/refresh"
+
+    developer:
+      description: "Can test endpoints and view their own audit events"
+      allowed_actions:
+        - "query"
+        - "execute_tool"
+        - "view_own_history"
+        - "view_own_audit_events"
+        - "test_endpoints"
+      denied_actions:
+        - "modify_config"
+        - "view_all_audit_logs"
+        - "manage_users"
+        - "delete_data"
+      rate_limit_multiplier: 1.5
+      token_expiry_override_minutes: null
+      max_concurrent_sessions: 5
+      allowed_endpoints:
+        - "GET /health"
+        - "POST /agent/query"
+        - "GET /auth/refresh"
+        - "GET /docs"
+
+    auditor:
+      description: "Read-only access to audit logs and security events. No agent access."
+      allowed_actions:
+        - "view_audit_logs"
+        - "view_all_audit_events"
+        - "export_audit_report"
+      denied_actions:
+        - "query"
+        - "execute_tool"
+        - "modify_config"
+        - "manage_users"
+        - "delete_data"
+      rate_limit_multiplier: 0.5
+      token_expiry_override_minutes: 480    # 8-hour audit session
+      max_concurrent_sessions: 1
+      allowed_endpoints:
+        - "GET /health"
+        - "GET /audit/logs"
+        - "GET /audit/export"
+        - "GET /auth/refresh"
+
+    admin:
+      description: "Full access. Should be used only for configuration management."
+      allowed_actions:
+        - "query"
+        - "execute_tool"
+        - "modify_config"
+        - "view_audit_logs"
+        - "manage_users"
+        - "revoke_tokens"
+        - "export_audit_report"
+      denied_actions: []
+      rate_limit_multiplier: 2.0
+      token_expiry_override_minutes: 30     # admins get SHORTER tokens — high impact role
+      max_concurrent_sessions: 2
+      require_mfa: true                     # enforce MFA for admin role
+      allowed_endpoints:
+        - "*"                               # all endpoints
+
+  # ──────────────────────────────────────────────────────────
+  # MULTI-FACTOR AUTHENTICATION
+  # ──────────────────────────────────────────────────────────
+  mfa:
+    enabled: false                      # set true to enforce globally
+    enforce_for_roles:
+      - "admin"
+    supported_methods:
+      - "totp"                          # Google Authenticator / Authy
+      - "email_otp"
+    totp:
+      issuer_name: "AI Security Wrapper"
+      digits: 6
+      period_seconds: 30
+      algorithm: "SHA1"
+    email_otp:
+      expiry_minutes: 5
+      code_length: 6
+
+  # ──────────────────────────────────────────────────────────
+  # SESSION MANAGEMENT
+  # ──────────────────────────────────────────────────────────
+  session:
+    track_active_sessions: true
+    max_concurrent_sessions_default: 3      # override per-role above
+    session_metadata:                       # fields stored per session
+      - "ip_address"
+      - "user_agent"
+      - "created_at"
+      - "last_seen_at"
+      - "device_fingerprint"
+    # Invalidate session if these change mid-session (session hijacking signal)
+    invalidate_on_change:
+      - "ip_address"                    # optional — can cause issues with mobile
+      - "user_agent"
+
+  # ──────────────────────────────────────────────────────────
+  # AUDIT EVENTS EMITTED BY AUTH LAYER
+  # ──────────────────────────────────────────────────────────
+  audit_events:
+    - "AUTH_SUCCESS"
+    - "AUTH_FAILURE"
+    - "TOKEN_ISSUED"
+    - "TOKEN_REFRESHED"
+    - "TOKEN_REVOKED"
+    - "MFA_SUCCESS"
+    - "MFA_FAILURE"
+    - "LOCKOUT_TRIGGERED"
+    - "LOCKOUT_CLEARED"
+    - "PERMISSION_DENIED"
+    - "SESSION_CREATED"
+    - "SESSION_DESTROYED"
+    - "CONCURRENT_SESSION_LIMIT_HIT"

@@ -1,0 +1,348 @@
+# ============================================================
+# Layer 6 — Audit Logger Configuration
+# Sources: NSA Event Logging Best Practices (2024),
+#          SIEM logging guide (cymulate/splunk 2025),
+#          GDPR/SOC 2/PCI-DSS retention requirements,
+#          ISO 27001 Annex A.12.4
+# ============================================================
+
+audit:
+
+  # ──────────────────────────────────────────────────────────
+  # LOG FILE & ROTATION
+  # ──────────────────────────────────────────────────────────
+  file:
+    primary_log: "logs/audit.log"
+    error_log: "logs/audit_error.log"   # errors in the logger itself
+    rotate: true
+    max_size_mb: 100                    # rotate when file hits this size
+    backup_count: 30                    # keep 30 rotated files
+    compress_rotated: true              # gzip old files
+    # Retention periods (align with your compliance framework)
+    retention:
+      hot_days: 30                      # keep on local disk: 30 days
+      warm_days: 365                    # archive to cold storage: 1 year (PCI-DSS)
+      # HIPAA requires 6 years → set warm_days: 2190
+      # SOC 2 typically requires 1 year → 365
+      # GDPR: retain only as long as necessary, document justification
+      cold_archive_path: ""            # e.g. "s3://your-bucket/audit-archive/"
+
+  # ──────────────────────────────────────────────────────────
+  # LOG FORMAT
+  # Structured JSON per NSA/CISA guidance — every field has a
+  # consistent name so SIEM correlation rules always match.
+  # ──────────────────────────────────────────────────────────
+  format:
+    type: "json"                        # "json" | "cef" | "leef"
+    timestamp_format: "ISO8601_UTC"     # always UTC — required for cross-timezone SIEM
+    # Standard fields present in EVERY log entry
+    required_fields:
+      - "timestamp"                     # ISO 8601 UTC
+      - "level"                         # INFO | WARNING | ERROR | CRITICAL
+      - "event_type"                    # see events_catalog below
+      - "trace_id"                      # UUID — links all events in one request
+      - "user_id"                       # authenticated user or "anonymous"
+      - "session_id"                    # session identifier
+      - "source_ip"                     # client IP (post-gateway)
+      - "service"                       # always "ai-security-wrapper"
+      - "version"                       # app version string
+
+    # Optional fields — included when available
+    optional_fields:
+      - "role"                          # user RBAC role
+      - "endpoint"                      # /agent/query
+      - "http_method"                   # POST, GET…
+      - "http_status"                   # response status code
+      - "duration_ms"                   # request processing time
+      - "layer"                         # which security layer emitted this
+      - "details"                       # layer-specific payload (see per-event rules)
+
+  # ──────────────────────────────────────────────────────────
+  # EVENT CATALOG
+  # Every event type, its severity, and what goes in "details".
+  # Aligns with MITRE ATT&CK & NSA log-source guidance.
+  # ──────────────────────────────────────────────────────────
+  events_catalog:
+
+    # ── Gateway events ──────────────────────────────────────
+    REQUEST_RECEIVED:
+      level: "INFO"
+      layer: "gateway"
+      details: ["ip", "path", "method", "user_agent", "content_length"]
+
+    RATE_LIMIT_HIT:
+      level: "WARNING"
+      layer: "gateway"
+      details: ["ip", "path", "limit_type", "requests_in_window"]
+
+    WAF_BLOCK:
+      level: "WARNING"
+      layer: "gateway"
+      details: ["ip", "reason", "rule_matched", "path"]
+
+    REQUEST_TOO_LARGE:
+      level: "WARNING"
+      layer: "gateway"
+      details: ["ip", "size_bytes", "limit_bytes"]
+
+    # ── Auth events ──────────────────────────────────────────
+    AUTH_SUCCESS:
+      level: "INFO"
+      layer: "auth"
+      details: ["role", "token_type", "token_jti"]
+
+    AUTH_FAILURE:
+      level: "WARNING"
+      layer: "auth"
+      details: ["reason", "ip", "attempted_user_id"]
+      # NEVER log: the token value, password, or secret
+
+    TOKEN_ISSUED:
+      level: "INFO"
+      layer: "auth"
+      details: ["role", "expiry", "token_jti"]
+
+    TOKEN_REFRESHED:
+      level: "INFO"
+      layer: "auth"
+      details: ["old_jti", "new_jti", "role"]
+
+    TOKEN_REVOKED:
+      level: "INFO"
+      layer: "auth"
+      details: ["reason", "token_jti", "revoked_by"]
+
+    LOCKOUT_TRIGGERED:
+      level: "WARNING"
+      layer: "auth"
+      details: ["ip", "failed_attempts", "lockout_duration_minutes"]
+
+    PERMISSION_DENIED:
+      level: "WARNING"
+      layer: "auth"
+      details: ["role", "action_attempted", "endpoint"]
+
+    # ── Sanitizer events ────────────────────────────────────
+    INJECTION_DETECTED:
+      level: "WARNING"
+      layer: "sanitizer"
+      details: ["category", "pattern_matched", "message_preview_chars_50"]
+      # message_preview_chars_50: first 50 chars only — never log full input
+
+    SCHEMA_VIOLATION:
+      level: "WARNING"
+      layer: "sanitizer"
+      details: ["field", "violation_type", "value_preview"]
+
+    INPUT_TOO_LONG:
+      level: "WARNING"
+      layer: "sanitizer"
+      details: ["length_chars", "max_allowed"]
+
+    # ── Agent events ─────────────────────────────────────────
+    AGENT_CALL:
+      level: "INFO"
+      layer: "agent"
+      details: ["message_length", "has_context", "tool_name"]
+
+    AGENT_RESPONSE:
+      level: "INFO"
+      layer: "agent"
+      details: ["response_length", "duration_ms"]
+
+    AGENT_TIMEOUT:
+      level: "ERROR"
+      layer: "agent"
+      details: ["timeout_seconds", "tool_in_progress"]
+
+    AGENT_ERROR:
+      level: "ERROR"
+      layer: "agent"
+      details: ["error_type", "error_message_preview"]
+
+    HUMAN_APPROVAL_REQUIRED:
+      level: "INFO"
+      layer: "agent"
+      details: ["action", "reason"]
+
+    HUMAN_APPROVAL_GRANTED:
+      level: "INFO"
+      layer: "agent"
+      details: ["action", "approved_by"]
+
+    HUMAN_APPROVAL_DENIED:
+      level: "WARNING"
+      layer: "agent"
+      details: ["action", "denied_by"]
+
+    # ── Output filter events ─────────────────────────────────
+    PII_REDACTED:
+      level: "INFO"
+      layer: "output_filter"
+      details: ["entity_types", "entity_count"]
+      # NEVER log: the actual PII values
+
+    SECRET_REDACTED:
+      level: "WARNING"
+      layer: "output_filter"
+      details: ["secret_type", "pattern_matched"]
+      # NEVER log: the actual secret value
+
+    POLICY_VIOLATION:
+      level: "WARNING"
+      layer: "output_filter"
+      details: ["violation_type", "topic", "response_action"]
+
+    RESPONSE_TRUNCATED:
+      level: "INFO"
+      layer: "output_filter"
+      details: ["original_length", "truncated_to"]
+
+    # ── System events ────────────────────────────────────────
+    ERROR:
+      level: "ERROR"
+      layer: "system"
+      details: ["error_type", "error_message", "stack_trace_preview"]
+
+    ANOMALY_DETECTED:
+      level: "CRITICAL"
+      layer: "system"
+      details: ["anomaly_type", "metric", "threshold", "current_value"]
+
+    SERVER_START:
+      level: "INFO"
+      layer: "system"
+      details: ["version", "config_hash", "layers_active"]
+
+    SERVER_STOP:
+      level: "INFO"
+      layer: "system"
+      details: ["uptime_seconds", "total_requests"]
+
+  # ──────────────────────────────────────────────────────────
+  # SENSITIVE FIELD PROTECTION
+  # These field names must NEVER appear in log entries.
+  # The logger will raise an exception if they are passed.
+  # ──────────────────────────────────────────────────────────
+  never_log:
+    field_names:
+      - "password"
+      - "passwd"
+      - "secret"
+      - "api_key"
+      - "apikey"
+      - "token"                         # log only token JTI, never the full token
+      - "access_token"
+      - "refresh_token"
+      - "credit_card"
+      - "card_number"
+      - "cvv"
+      - "ssn"
+      - "private_key"
+      - "Authorization"                 # HTTP header — never log value
+    # If a "details" dict contains these keys, replace the value with "[SUPPRESSED]"
+    on_violation: "suppress_and_warn"   # "suppress_and_warn" | "raise"
+
+  # ──────────────────────────────────────────────────────────
+  # ANOMALY DETECTION
+  # In-process threshold-based detection. For production, route
+  # to a proper SIEM (Splunk, Datadog, Elastic, Loki).
+  # ──────────────────────────────────────────────────────────
+  anomaly_detection:
+    enabled: true
+
+    rules:
+      high_auth_failure_rate:
+        event: "AUTH_FAILURE"
+        window_seconds: 60
+        threshold: 10
+        action: "emit_ANOMALY_DETECTED"
+        severity: "critical"
+
+      repeated_injections:
+        event: "INJECTION_DETECTED"
+        window_seconds: 3600
+        threshold: 5
+        action: "emit_ANOMALY_DETECTED"
+        severity: "critical"
+
+      repeated_rate_limit_hits:
+        event: "RATE_LIMIT_HIT"
+        window_seconds: 300
+        threshold: 50
+        action: "emit_ANOMALY_DETECTED"
+        severity: "high"
+
+      high_pii_redaction_rate:
+        event: "PII_REDACTED"
+        window_seconds: 300
+        threshold: 20
+        action: "emit_ANOMALY_DETECTED"
+        severity: "high"
+
+      repeated_permission_denied:
+        event: "PERMISSION_DENIED"
+        window_seconds: 60
+        threshold: 5
+        action: "emit_ANOMALY_DETECTED"
+        severity: "high"
+
+      secret_leak_attempt:
+        event: "SECRET_REDACTED"
+        window_seconds: 60
+        threshold: 3
+        action: "emit_ANOMALY_DETECTED"
+        severity: "critical"
+
+      agent_errors_spike:
+        event: "AGENT_ERROR"
+        window_seconds: 300
+        threshold: 10
+        action: "emit_ANOMALY_DETECTED"
+        severity: "high"
+
+  # ──────────────────────────────────────────────────────────
+  # LOG INTEGRITY
+  # Prevent tampering: sign each log entry with an HMAC
+  # so any modification is detectable.
+  # ──────────────────────────────────────────────────────────
+  integrity:
+    sign_entries: false                 # set true for high-compliance environments
+    algorithm: "HMAC-SHA256"
+    # Loaded from .env: LOG_SIGNING_SECRET
+    # On verification: compute HMAC of the JSON body and compare to "signature" field
+
+  # ──────────────────────────────────────────────────────────
+  # SIEM / EXTERNAL FORWARDING
+  # Forward logs to an external system in real-time.
+  # ──────────────────────────────────────────────────────────
+  siem:
+    enabled: false
+    provider: "none"                    # "none" | "splunk" | "datadog" | "elastic" | "loki" | "webhook"
+    # Splunk HEC
+    splunk:
+      hec_url: ""                       # https://your-splunk:8088/services/collector
+      hec_token: ""                     # loaded from .env: SPLUNK_HEC_TOKEN
+      index: "ai_security"
+      source_type: "ai_security_wrapper"
+    # Datadog
+    datadog:
+      api_key: ""                       # loaded from .env: DD_API_KEY
+      site: "datadoghq.com"
+      service: "ai-security-wrapper"
+    # Generic webhook
+    webhook:
+      url: ""
+      method: "POST"
+      headers: {}
+      batch_size: 100
+      flush_interval_seconds: 5
+
+  # ──────────────────────────────────────────────────────────
+  # PERFORMANCE
+  # ──────────────────────────────────────────────────────────
+  performance:
+    async_write: true                   # write to log asynchronously (non-blocking)
+    queue_size: 10000                   # max buffered log entries
+    flush_interval_seconds: 1           # how often to flush the buffer to disk
+    on_queue_full: "drop_oldest"        # "drop_oldest" | "block" | "drop_newest"

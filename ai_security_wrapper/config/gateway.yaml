@@ -1,0 +1,236 @@
+# ============================================================
+# Layer 1 — API Gateway Configuration
+# Sources: OWASP API Security Top 10 (2023), AWS WAF best
+#          practices (2025), Cloudflare rate-limiting guide,
+#          Practical DevSecOps (2026)
+# ============================================================
+
+gateway:
+
+  server:
+    host: "0.0.0.0"
+    port: 8000
+    debug: false                        # NEVER true in production
+    workers: 4                          # match CPU core count
+    keepalive_timeout: 65               # seconds
+    graceful_shutdown_timeout: 30       # seconds
+
+  # ──────────────────────────────────────────────────────────
+  # TLS / HTTPS
+  # ──────────────────────────────────────────────────────────
+  tls:
+    enabled: false                      # set true in production
+    min_version: "TLSv1.2"             # never allow TLS 1.0 / 1.1
+    preferred_version: "TLSv1.3"
+    cert_file: ""                       # path to your .pem cert
+    key_file: ""                        # path to your private key
+    hsts:
+      enabled: true
+      max_age_seconds: 31536000         # 1 year
+      include_subdomains: true
+      preload: true
+
+  # ──────────────────────────────────────────────────────────
+  # RATE LIMITING
+  # Multi-tier: global → per-IP → per-user → per-endpoint
+  # Research: layering per-IP (WAF) + per-key (gateway) catches
+  # both DDoS and credential stuffing (AWS API GW best practices)
+  # ──────────────────────────────────────────────────────────
+  rate_limit:
+
+    # Global defaults (applied when no role-specific rule matches)
+    global:
+      requests_per_minute: 60
+      requests_per_hour: 500
+      requests_per_day: 5000
+      burst_limit: 10                   # token-bucket burst capacity
+
+    # Per-role overrides — multiplied against global defaults
+    by_role:
+      read_only:
+        multiplier: 0.5                 # 30/min, 250/hr
+      agent_user:
+        multiplier: 1.0                 # 60/min, 500/hr
+      admin:
+        multiplier: 2.0                 # 120/min, 1000/hr
+
+    # Per-endpoint overrides (stricter for sensitive paths)
+    by_endpoint:
+      "/auth/token":
+        requests_per_minute: 10         # brute-force protection
+        requests_per_hour: 30
+        lockout_after_failures: 5
+        lockout_duration_minutes: 15
+      "/agent/query":
+        requests_per_minute: 30
+        requests_per_hour: 200
+        cost_per_request: 1             # for token-bucket deduction
+      "/admin":
+        requests_per_minute: 5
+        requests_per_hour: 50
+
+    # Response headers to expose to clients (RFC 6585 compliant)
+    headers:
+      expose_ratelimit_limit: true      # X-RateLimit-Limit
+      expose_ratelimit_remaining: true  # X-RateLimit-Remaining
+      expose_ratelimit_reset: true      # X-RateLimit-Reset
+      expose_retry_after: true          # Retry-After on 429
+
+    # Storage backend for distributed counter state
+    storage:
+      backend: "memory"                 # "memory" | "redis" | "valkey"
+      redis_url: ""                     # set if backend = redis
+      key_prefix: "rl:"
+      key_ttl_seconds: 3600
+
+    # Action when limit is exceeded
+    on_exceeded:
+      http_status: 429
+      response_body: '{"error":"rate_limit_exceeded","message":"Too many requests — please slow down","retry_after_seconds":60}'
+      log_event: true
+      audit_event: "RATE_LIMIT_HIT"
+
+  # ──────────────────────────────────────────────────────────
+  # WEB APPLICATION FIREWALL (WAF)
+  # ──────────────────────────────────────────────────────────
+  waf:
+    enabled: true
+
+    # Default action when no rule explicitly allows or blocks
+    default_action: "allow"
+
+    # ── Blocked user agents ──────────────────────────────────
+    # Known vulnerability scanners, fuzzers, scrapers
+    blocked_user_agents:
+      # Vulnerability scanners
+      - "sqlmap"
+      - "nikto"
+      - "nessus"
+      - "openvas"
+      - "nmap"
+      - "masscan"
+      - "zap"                           # OWASP ZAP
+      - "burpsuite"
+      - "w3af"
+      - "acunetix"
+      # Fuzzing / brute-force tools
+      - "hydra"
+      - "medusa"
+      - "gobuster"
+      - "dirbuster"
+      - "ffuf"
+      - "wfuzz"
+      # Scrapers / headless bots
+      - "scrapy"
+      - "python-requests"               # flag; most legitimate apps set a custom UA
+      - "curl/"                         # flag; override if your legitimate client uses curl
+      - "wget/"
+      # Exploit frameworks
+      - "metasploit"
+      - "msfconsole"
+
+    # ── Blocked IP ranges ────────────────────────────────────
+    blocked_ip_ranges: []               # add CIDRs: "185.220.0.0/16" (Tor exits), etc.
+
+    # ── Allowed origins (CORS) ───────────────────────────────
+    cors:
+      allowed_origins:
+        - "*"                           # replace with explicit domains in production
+      allowed_methods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowed_headers:
+        - "Authorization"
+        - "Content-Type"
+        - "X-Trace-ID"
+        - "X-Request-ID"
+      expose_headers:
+        - "X-RateLimit-Limit"
+        - "X-RateLimit-Remaining"
+        - "X-RateLimit-Reset"
+      allow_credentials: true
+      max_age_seconds: 3600
+
+    # ── Request size limits ──────────────────────────────────
+    request_limits:
+      max_body_bytes: 1048576           # 1 MB — block oversized bodies
+      max_url_length: 2048              # block unusually long URLs
+      max_header_count: 50             # block header-flooding attacks
+      max_header_size_bytes: 8192       # per-header limit
+      max_query_string_length: 1024
+
+    # ── HTTP method allowlist ────────────────────────────────
+    # Only allow methods your API actually uses
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "OPTIONS"
+      - "HEAD"
+    # Any request using a method not in this list → 405
+
+    # ── Security response headers ────────────────────────────
+    # Injected on every response
+    security_headers:
+      "X-Content-Type-Options": "nosniff"
+      "X-Frame-Options": "DENY"
+      "X-XSS-Protection": "1; mode=block"
+      "Referrer-Policy": "strict-origin-when-cross-origin"
+      "Permissions-Policy": "geolocation=(), microphone=(), camera=()"
+      "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'"
+      "Cache-Control": "no-store"        # prevent caching of API responses
+
+    # ── Path traversal & injection detection ────────────────
+    path_protection:
+      enabled: true
+      block_path_traversal: true        # block /../../../etc/passwd
+      block_null_bytes: true            # block %00 in URL
+      block_encoded_slashes: true       # block %2F, %5C
+      suspicious_extensions:           # block requests to these file extensions
+        - ".php"
+        - ".asp"
+        - ".aspx"
+        - ".jsp"
+        - ".env"
+        - ".git"
+        - ".htaccess"
+        - ".htpasswd"
+        - ".sql"
+        - ".bak"
+        - ".swp"
+        - ".DS_Store"
+
+    # ── DDoS protection ──────────────────────────────────────
+    ddos:
+      enabled: true
+      syn_flood_threshold: 1000         # connections/sec from a single IP
+      slow_loris_timeout: 10            # seconds for incomplete request headers
+      max_concurrent_connections_per_ip: 20
+
+    # ── Geo-blocking (optional) ──────────────────────────────
+    geo_blocking:
+      enabled: false
+      mode: "allowlist"                 # "allowlist" or "blocklist"
+      allowed_countries: []            # ISO 3166-1 alpha-2, e.g. ["US","GB","CA"]
+      blocked_countries: []            # add known high-risk sources if needed
+
+  # ──────────────────────────────────────────────────────────
+  # REQUEST TRACING
+  # Every request gets a UUID trace-ID for audit correlation
+  # ──────────────────────────────────────────────────────────
+  tracing:
+    enabled: true
+    header_name: "X-Trace-ID"           # read from request, or generate if absent
+    propagate_to_response: true         # echo trace-ID back in response headers
+    id_format: "uuid4"                  # "uuid4" | "nanoid" | "custom"
+
+  # ──────────────────────────────────────────────────────────
+  # HEALTH & READINESS ENDPOINTS
+  # ──────────────────────────────────────────────────────────
+  health:
+    liveness_path: "/health"
+    readiness_path: "/ready"
+    metrics_path: "/metrics"            # expose Prometheus metrics
+    # These paths bypass rate limiting and auth
+    bypass_auth: true
+    bypass_rate_limit: true
