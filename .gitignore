@@ -1,0 +1,16 @@
+.env
+*.log
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.spec
+venv/
+ai_security_wrapper/agent/vector_db/
+ai_security_wrapper/agent/bm25_index.pkl
+.skills/
+documents/
+vector_db/
+bm25_index.pkl
