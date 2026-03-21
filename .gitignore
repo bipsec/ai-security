@@ -14,3 +14,6 @@ ai_security_wrapper/agent/bm25_index.pkl
 documents/
 vector_db/
 bm25_index.pkl
+
+.venv/
+/ai_security_wrapper.egg-info/

@@ -155,7 +155,6 @@ ai-security/
 ### 1. Clone and set up the environment
 
 ```bash
-git clone <repo-url>
 cd ai-security
 python -m venv venv
 source venv/bin/activate        # Linux/Mac
@@ -163,6 +162,11 @@ venv\Scripts\activate           # Windows
 ```
 
 ### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
 
 ```bash
 pip install fastapi uvicorn slowapi python-dotenv pyyaml pyjwt
